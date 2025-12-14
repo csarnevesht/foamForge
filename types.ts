@@ -7,7 +7,7 @@ export enum ViewState {
 
 export interface GeneratedPattern {
   name: string;
-  svgPath: string; // The 'd' attribute for an SVG path
+  points: {x: number, y: number}[]; // Ordered list of coordinates for the continuous path
   description: string;
   difficulty: string; // "Easy", "Medium", "Hard"
   estimatedCutTime: string;

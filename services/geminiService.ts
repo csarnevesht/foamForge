@@ -8,25 +8,57 @@ const patternSchema: Schema = {
   type: Type.OBJECT,
   properties: {
     name: { type: Type.STRING, description: "A creative name for the pattern" },
-    svgPath: { type: Type.STRING, description: "A valid SVG 'd' path attribute string that draws the requested shape. It should be centered in a 100x100 viewBox." },
+    points: { 
+      type: Type.ARRAY,
+      description: "A dense ordered list of X,Y coordinates (0-100) forming the continuous cut path.",
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          x: { type: Type.NUMBER },
+          y: { type: Type.NUMBER }
+        },
+        required: ["x", "y"]
+      }
+    },
     description: { type: Type.STRING, description: "Short description of the shape and usage." },
     difficulty: { type: Type.STRING, description: "Estimated difficulty: Easy, Medium, or Hard" },
     estimatedCutTime: { type: Type.STRING, description: "Estimated time to cut with hot wire, e.g., '5 mins'" },
   },
-  required: ["name", "svgPath", "description", "difficulty", "estimatedCutTime"],
+  required: ["name", "points", "description", "difficulty", "estimatedCutTime"],
 };
 
 export const generatePattern = async (prompt: string): Promise<GeneratedPattern> => {
   try {
-    const model = "gemini-2.5-flash"; 
+    const model = "gemini-3-pro-preview"; 
     const response = await ai.models.generateContent({
       model,
-      contents: `Create a continuous single-line SVG path (suitable for hot wire foam cutting) for the following request: ${prompt}. 
-      Ensure the path is closed if it's a solid shape. The path coordinates should fit roughly within a 0,0 to 100,100 coordinate space.`,
+      contents: `You are an expert CNC Hot Wire Foam Cutter path generator.
+      
+      User Request: Create a cut path for: "${prompt}".
+
+      CRITICAL GEOMETRIC RULES:
+      1. COORDINATE SYSTEM: Use Standard Cartesian Coordinates. (0,0) is BOTTOM-LEFT. (100,100) is TOP-RIGHT.
+         - Ensure the shape is upright in this coordinate system.
+      2. SINGLE CONTINUOUS POLYLINE: The output must be a single ordered array of coordinates. The wire CANNOT lift.
+      3. HANDLING TEXT / MULTIPLE SHAPES:
+         - If the input is text (e.g., "HELLO") or disjoint shapes, you MUST connect them.
+         - Strategy: Draw the first letter, then exit at the bottom-right, draw a connecting line along the bottom (baseline) to the start of the next letter.
+         - Do not cross through the middle of the shape if possible.
+      4. INTERNAL HOLES (The "Hidden Seam"):
+         - To cut a hole (e.g., inside 'A', 'O', 'B'), use the "Bridge" method.
+         - Cut from the outer perimeter -> Enter at a vertex -> Cut the hole -> Exit at the same vertex -> Resume outer perimeter.
+      5. DENSITY: Use enough points to make curves look smooth.
+
+      ALGORITHM EXAMPLE (Letter 'O'):
+      Start at outside bottom-left -> Trace outside to bottom-middle -> Cut IN to inner bottom-middle -> Trace inner circle -> Cut OUT to outer bottom-middle -> Finish tracing outside.
+
+      Fit the shape coordinates roughly within 0-100 range.
+      Return the response in the specified JSON schema.
+      `,
       config: {
         responseMimeType: "application/json",
         responseSchema: patternSchema,
-        systemInstruction: "You are an expert CNC and manual hot wire foam cutter. You generate vector paths optimized for continuous wire cutting."
+        systemInstruction: "You are a specialized G-code generator. Output coordinates where Y=0 is the floor/bottom. Always connect disjoint letters with a baseline segment."
       }
     });
 
