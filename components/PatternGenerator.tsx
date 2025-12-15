@@ -27,7 +27,8 @@ const PatternGenerator: React.FC = () => {
       const result = await generatePattern(prompt);
       setPattern(result);
     } catch (e) {
-      alert("Failed to generate pattern. Please try again.");
+      const msg = (e as any)?.message || "Failed to generate pattern. Please try again.";
+      alert(msg);
     } finally {
       setLoading(false);
     }
@@ -39,8 +40,16 @@ const PatternGenerator: React.FC = () => {
   // Therefore, we must invert the Y axis for visualization: svgY = 100 - p.y
   const svgPathData = useMemo(() => {
     if (!pattern || !pattern.points || pattern.points.length === 0) return '';
-    return `M ${pattern.points[0].x} ${100 - pattern.points[0].y} ` + 
-           pattern.points.slice(1).map(p => `L ${p.x} ${100 - p.y}`).join(' ');
+    const pts = pattern.points;
+    const isClosed =
+      pts.length > 2 &&
+      Math.abs(pts[0].x - pts[pts.length - 1].x) < 1e-6 &&
+      Math.abs(pts[0].y - pts[pts.length - 1].y) < 1e-6;
+
+    const body = `M ${pts[0].x} ${100 - pts[0].y} ` +
+      pts.slice(1).map(p => `L ${p.x} ${100 - p.y}`).join(' ');
+
+    return isClosed ? `${body} Z` : body;
   }, [pattern]);
 
   // Generators
@@ -78,6 +87,10 @@ M2 ; End of program
   const generateDXF = () => {
     if (!pattern) return '';
     const points = pattern.points;
+    const isClosed =
+      points.length > 2 &&
+      Math.abs(points[0].x - points[points.length - 1].x) < 1e-6 &&
+      Math.abs(points[0].y - points[points.length - 1].y) < 1e-6;
     let dxf = `0
 SECTION
 2
@@ -103,8 +116,8 @@ AcDbPolyline
 90
 ${points.length}
 70
-0
-`; // 70 0 = Open polyline (default)
+${isClosed ? 1 : 0}
+`; // 70 1 = Closed polyline, 70 0 = Open polyline
 
     points.forEach(p => {
         dxf += `10\n${p.x.toFixed(4)}\n20\n${p.y.toFixed(4)}\n`;

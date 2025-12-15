@@ -1,8 +1,23 @@
 import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { GeneratedPattern } from "../types";
 
-const apiKey = process.env.API_KEY || '';
-const ai = new GoogleGenAI({ apiKey });
+const getApiKey = (): string => {
+  // Vite injects these via `vite.config.ts` `define` (and in some environments they may be undefined).
+  const key = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  if (!key) {
+    throw new Error(
+      "Missing GEMINI_API_KEY. Create a `.env.local` file with `GEMINI_API_KEY=...` (see `.env.example`)."
+    );
+  }
+  return key;
+};
+
+let ai: GoogleGenAI | null = null;
+const getAiClient = (): GoogleGenAI => {
+  if (ai) return ai;
+  ai = new GoogleGenAI({ apiKey: getApiKey() });
+  return ai;
+};
 
 const patternSchema: Schema = {
   type: Type.OBJECT,
@@ -28,18 +43,15 @@ const patternSchema: Schema = {
 };
 
 export const generatePattern = async (prompt: string): Promise<GeneratedPattern> => {
-  try {
-    const model = "gemini-3-pro-preview"; 
-    const response = await ai.models.generateContent({
-      model,
-      contents: `You are an expert CNC Hot Wire Foam Cutter path generator.
+  const buildContents = (userPrompt: string, extra: string) => `You are an expert CNC Hot Wire Foam Cutter path generator.
       
-      User Request: Create a cut path for: "${prompt}".
+      User Request: Create a cut path for: "${userPrompt}".
 
       CRITICAL GEOMETRIC RULES:
       1. COORDINATE SYSTEM: Use Standard Cartesian Coordinates. (0,0) is BOTTOM-LEFT. (100,100) is TOP-RIGHT.
          - Ensure the shape is upright in this coordinate system.
       2. SINGLE CONTINUOUS POLYLINE: The output must be a single ordered array of coordinates. The wire CANNOT lift.
+      2b. CLOSED OUTLINE: This is an exterior silhouette. The path MUST return to the start (the last point should equal the first point).
       3. HANDLING TEXT / MULTIPLE SHAPES:
          - If the input is text (e.g., "HELLO") or disjoint shapes, you MUST connect them.
          - Strategy: Draw the first letter, then exit at the bottom-right, draw a connecting line along the bottom (baseline) to the start of the next letter.
@@ -47,33 +59,227 @@ export const generatePattern = async (prompt: string): Promise<GeneratedPattern>
       4. INTERNAL HOLES (The "Hidden Seam"):
          - To cut a hole (e.g., inside 'A', 'O', 'B'), use the "Bridge" method.
          - Cut from the outer perimeter -> Enter at a vertex -> Cut the hole -> Exit at the same vertex -> Resume outer perimeter.
-      5. DENSITY: Use enough points to make curves look smooth.
+      5. DENSITY: Use MANY points so curves look smooth. Target 250-500 points for silhouettes (more for complex shapes). Avoid long straight segments.
+      6. SILHOUETTE QUALITY: Prefer organic, rounded contours (no jagged polygon look). Include characteristic features relevant to the prompt (e.g. head/snout/ears/legs/tail for an animal silhouette).
+      7. AVOID DEGENERATE OUTPUT: Do NOT output a simple polygon. The outline must have many distinct curves and features.
 
       ALGORITHM EXAMPLE (Letter 'O'):
       Start at outside bottom-left -> Trace outside to bottom-middle -> Cut IN to inner bottom-middle -> Trace inner circle -> Cut OUT to outer bottom-middle -> Finish tracing outside.
 
       Fit the shape coordinates roughly within 0-100 range.
       Return the response in the specified JSON schema.
-      `,
+      
+      ${extra}
+      `;
+
+  const generateOnce = async (userPrompt: string, extra: string, model: string) => {
+    const response = await getAiClient().models.generateContent({
+      model,
+      contents: buildContents(userPrompt, extra),
       config: {
         responseMimeType: "application/json",
         responseSchema: patternSchema,
-        systemInstruction: "You are a specialized G-code generator. Output coordinates where Y=0 is the floor/bottom. Always connect disjoint letters with a baseline segment."
+        // Keep this fairly deterministic because we're requiring strict JSON.
+        temperature: 0.3,
+        topP: 0.8,
+        maxOutputTokens: 2048,
+        systemInstruction:
+          "You are a specialized G-code generator. Output coordinates where Y=0 is the floor/bottom. Always connect disjoint letters with a baseline segment.",
       }
     });
 
     const text = response.text;
     if (!text) throw new Error("No response from AI");
     
-    return JSON.parse(text) as GeneratedPattern;
+    try {
+      const parsed = JSON.parse(text) as GeneratedPattern;
+      return postProcessPattern(parsed);
+    } catch (parseErr) {
+      console.error("Failed to parse AI JSON response:", { text });
+      const preview = text.length > 300 ? `${text.slice(0, 300)}…` : text;
+      throw new Error(`AI returned invalid JSON. First 300 chars: ${preview}`);
+    }
+  };
+
+  try {
+    // Prefer higher quality for shape generation; fall back if model isn't available for this key.
+    const preferredModels = ["gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"];
+
+    const extraAttempt1 = "";
+    const extraAttempt2 =
+      "QUALITY FEEDBACK: The last result was too geometric / polygon-like. Regenerate with a much more dog-like outline (head/snout, ears, chest, belly, 4 legs, tail). Avoid any straight edge longer than ~8 units. Ensure many smooth arcs and direction changes across the outline.";
+
+    let best: GeneratedPattern | null = null;
+    let lastErr: unknown = null;
+
+    for (const model of preferredModels) {
+      try {
+        // Attempt 1
+        const p1 = await generateOnce(prompt, extraAttempt1, model);
+        best = best ?? p1;
+        if (isPatternQualityAcceptable(p1.points)) return p1;
+
+        // Attempt 2 with stronger constraints
+        const p2 = await generateOnce(prompt, extraAttempt2, model);
+        best = p2;
+        if (isPatternQualityAcceptable(p2.points)) return p2;
+
+        // If both are poor, try the next model (don't hard-fail on one model)
+      } catch (err) {
+        // Model not available / auth errors / transient errors: try next model
+        console.warn(`Pattern generation attempt failed for model "${model}"`, err);
+        lastErr = err;
+      }
+    }
+
+    if (best) return best;
+
+    const lastMsg =
+      (lastErr as any)?.message ||
+      (typeof lastErr === 'string' ? lastErr : '') ||
+      'Unknown error';
+    throw new Error(`All models failed. Last error: ${lastMsg}`);
   } catch (error) {
     console.error("Pattern generation failed:", error);
     throw error;
   }
 };
 
+const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
+
+const samePoint = (a: { x: number; y: number }, b: { x: number; y: number }, eps = 1e-6) =>
+  Math.abs(a.x - b.x) < eps && Math.abs(a.y - b.y) < eps;
+
+/**
+ * Chaikin smoothing for a CLOSED polyline. Each iteration doubles points and rounds corners.
+ * This is a geometry-only post-process; it cannot add semantic detail, but it reduces the "polygon" look.
+ */
+const chaikinSmoothClosed = (points: { x: number; y: number }[], iterations: number) => {
+  let pts = points;
+  for (let it = 0; it < iterations; it++) {
+    const out: { x: number; y: number }[] = [];
+    const n = pts.length;
+    for (let i = 0; i < n; i++) {
+      const p0 = pts[i];
+      const p1 = pts[(i + 1) % n];
+      // Q = 0.75*p0 + 0.25*p1, R = 0.25*p0 + 0.75*p1
+      out.push({ x: 0.75 * p0.x + 0.25 * p1.x, y: 0.75 * p0.y + 0.25 * p1.y });
+      out.push({ x: 0.25 * p0.x + 0.75 * p1.x, y: 0.25 * p0.y + 0.75 * p1.y });
+    }
+    pts = out;
+  }
+  return pts;
+};
+
+const postProcessPattern = (pattern: GeneratedPattern): GeneratedPattern => {
+  const raw = Array.isArray(pattern?.points) ? pattern.points : [];
+
+  // Filter/clean + clamp to [0,100]
+  const cleaned = raw
+    .filter((p) => p && isFiniteNumber((p as any).x) && isFiniteNumber((p as any).y))
+    .map((p) => ({ x: clamp((p as any).x, 0, 100), y: clamp((p as any).y, 0, 100) }));
+
+  // Remove consecutive duplicates
+  const deduped: { x: number; y: number }[] = [];
+  for (const p of cleaned) {
+    if (deduped.length === 0 || !samePoint(deduped[deduped.length - 1], p)) deduped.push(p);
+  }
+
+  if (deduped.length < 4) return pattern;
+
+  // Ensure closed (without duplicating the last point for processing)
+  const closedNoDup = samePoint(deduped[0], deduped[deduped.length - 1]) ? deduped.slice(0, -1) : deduped;
+
+  // Smoothing: only when the model gives too few points (don't wash out detail on high-res paths)
+  const iterations = closedNoDup.length < 120 ? 3 : closedNoDup.length < 220 ? 2 : 0;
+  const smoothed = iterations > 0 ? chaikinSmoothClosed(closedNoDup, iterations) : closedNoDup;
+
+  // Re-close by duplicating start point at the end (useful for G-code + SVG closing)
+  const finalPoints = [...smoothed, { ...smoothed[0] }];
+
+  return {
+    ...pattern,
+    points: finalPoints,
+  };
+};
+
+// --- Quality gate to detect "degenerate polygon" outputs and trigger a retry ---
+const dist2 = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return dx * dx + dy * dy;
+};
+
+const distPointToSegment = (p: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) => {
+  const vx = b.x - a.x;
+  const vy = b.y - a.y;
+  const wx = p.x - a.x;
+  const wy = p.y - a.y;
+  const c1 = vx * wx + vy * wy;
+  if (c1 <= 0) return Math.sqrt(dist2(p, a));
+  const c2 = vx * vx + vy * vy;
+  if (c2 <= c1) return Math.sqrt(dist2(p, b));
+  const t = c1 / c2;
+  const proj = { x: a.x + t * vx, y: a.y + t * vy };
+  return Math.sqrt(dist2(p, proj));
+};
+
+// RDP polyline simplification (closed path expected without duplicate endpoint)
+const simplifyRdp = (pts: { x: number; y: number }[], epsilon: number) => {
+  if (pts.length <= 2) return pts;
+  let dmax = 0;
+  let idx = 0;
+  const end = pts.length - 1;
+  for (let i = 1; i < end; i++) {
+    const d = distPointToSegment(pts[i], pts[0], pts[end]);
+    if (d > dmax) {
+      idx = i;
+      dmax = d;
+    }
+  }
+  if (dmax > epsilon) {
+    const rec1 = simplifyRdp(pts.slice(0, idx + 1), epsilon);
+    const rec2 = simplifyRdp(pts.slice(idx), epsilon);
+    return rec1.slice(0, -1).concat(rec2);
+  }
+  return [pts[0], pts[end]];
+};
+
+const isPatternQualityAcceptable = (pointsWithMaybeDupEnd: { x: number; y: number }[]) => {
+  if (!pointsWithMaybeDupEnd || pointsWithMaybeDupEnd.length < 80) return false;
+
+  const pts =
+    pointsWithMaybeDupEnd.length > 3 &&
+    samePoint(pointsWithMaybeDupEnd[0], pointsWithMaybeDupEnd[pointsWithMaybeDupEnd.length - 1])
+      ? pointsWithMaybeDupEnd.slice(0, -1)
+      : pointsWithMaybeDupEnd;
+
+  if (pts.length < 80) return false;
+
+  // Detect overly straight / polygonal outlines by simplifying and counting "major corners"
+  const simplified = simplifyRdp(pts, 1.5);
+  const majorVertices = simplified.length;
+
+  // Also flag if there are very long edges (in normalized 0-100 space)
+  let maxSeg = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    const seg = Math.sqrt(dist2(a, b));
+    if (seg > maxSeg) maxSeg = seg;
+  }
+
+  // Heuristics tuned to catch "giant triangle" / "few-sided polygon" failures
+  if (majorVertices < 18) return false;
+  if (maxSeg > 18) return false;
+
+  return true;
+};
+
 export const getChatResponseStream = async (history: { role: string, parts: { text: string }[] }[], newMessage: string) => {
-    const chat = ai.chats.create({
+    const chat = getAiClient().chats.create({
         model: 'gemini-2.5-flash',
         config: {
             systemInstruction: "You are 'Volt', a helpful AI assistant for foam cutting enthusiasts. You know about XPS, EPS, EPP foams, hot wire cutters, CNC machines, and manual crafting techniques. Keep answers concise, practical, and safety-focused (remind about fumes).",
