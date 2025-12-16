@@ -92,12 +92,13 @@ export const generatePattern = async (prompt: string): Promise<GeneratedPattern>
     if (!text) throw new Error("No response from AI");
     
     try {
-      const parsed = JSON.parse(text) as GeneratedPattern;
+      const parsed = safeParseJsonFromModel(text) as GeneratedPattern;
       return postProcessPattern(parsed);
     } catch (parseErr) {
       console.error("Failed to parse AI JSON response:", { text });
       const preview = text.length > 300 ? `${text.slice(0, 300)}…` : text;
-      throw new Error(`AI returned invalid JSON. First 300 chars: ${preview}`);
+      const msg = (parseErr as any)?.message ? ` (${(parseErr as any).message})` : '';
+      throw new Error(`AI returned invalid JSON. First 300 chars: ${preview}${msg}`);
     }
   };
 
@@ -221,6 +222,43 @@ const postProcessPattern = (pattern: GeneratedPattern): GeneratedPattern => {
     ...pattern,
     points: finalPoints,
   };
+};
+
+// --- Robust JSON parsing for model output ---
+const stripCodeFences = (s: string) =>
+  s
+    .replace(/^\s*```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/i, '')
+    .trim();
+
+const extractFirstJsonObject = (s: string) => {
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  return s.slice(start, end + 1);
+};
+
+// Remove common trailing commas: `{ "a": 1, }` or `[1,2,]`
+const removeTrailingCommas = (s: string) => s.replace(/,\s*([}\]])/g, '$1');
+
+const safeParseJsonFromModel = (rawText: string): unknown => {
+  const t1 = stripCodeFences(rawText);
+  const candidates = [t1, extractFirstJsonObject(t1)].filter(Boolean) as string[];
+
+  let lastErr: unknown = null;
+  for (const c of candidates) {
+    try {
+      return JSON.parse(c);
+    } catch (e1) {
+      lastErr = e1;
+      try {
+        return JSON.parse(removeTrailingCommas(c));
+      } catch (e2) {
+        lastErr = e2;
+      }
+    }
+  }
+  throw lastErr ?? new Error('Unable to parse JSON');
 };
 
 // --- Quality gate to detect "degenerate polygon" outputs and trigger a retry ---
