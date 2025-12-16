@@ -3,6 +3,39 @@ import { generatePattern } from '../services/geminiService';
 import { GeneratedPattern } from '../types';
 import { IconDownload, IconLoader, IconZap, IconCode, IconX } from './Icons';
 
+const PROMPT_EXAMPLES: { id: string; label: string; prompt: string }[] = [
+  {
+    id: 'letter-a',
+    label: "Letter: 'A' (outline + bridge)",
+    prompt:
+      "Block letter 'A' as a single continuous OUTLINE path (not separate strokes). Include the inner hole using the bridge method. Start at bottom-left. Smooth curves, 300–600 points, closed loop.",
+  },
+  {
+    id: 'word-foam',
+    label: "Word: 'FOAM' (stencil, continuous)",
+    prompt:
+      "The word 'FOAM' in a bold stencil style as ONE continuous cut path. Connect letters along a bottom baseline so the wire never lifts. Include bridges for enclosed holes (O/A). Closed loop, smooth corners, 600–1200 points.",
+  },
+  {
+    id: 'wing-naca0012',
+    label: 'RC wing: NACA 0012 outline',
+    prompt:
+      'A symmetrical NACA 0012 wing profile OUTLINE, chord from x=10 to x=90, max thickness at 30% chord. Single closed outline, smooth leading edge, denser points near leading edge (800+ points).',
+  },
+  {
+    id: 'heart',
+    label: 'Shape: heart silhouette',
+    prompt:
+      'A heart silhouette with a smooth top and pointed bottom. Single closed outline, no sharp polygon corners, 400–800 points.',
+  },
+  {
+    id: 'dog',
+    label: 'Silhouette: dog (standing)',
+    prompt:
+      'A dog silhouette standing in profile, tail up, ears visible. Smooth organic outline with head/snout/ears/chest/belly/4 legs/tail. Single closed loop, avoid long straight segments, 600–1200 points.',
+  },
+];
+
 const Tooltip = ({ children, text, className = "" }: { children: React.ReactNode; text: string; className?: string }) => (
   <div className={`group relative ${className}`}>
     {children}
@@ -18,6 +51,7 @@ const PatternGenerator: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [pattern, setPattern] = useState<GeneratedPattern | null>(null);
   const [showGCode, setShowGCode] = useState(false);
+  const [selectedExampleId, setSelectedExampleId] = useState<string>('');
 
   const handleGenerate = async () => {
     if (!prompt.trim()) return;
@@ -177,6 +211,61 @@ EOF
         
         {/* Input Section */}
         <div className="space-y-6 bg-slate-800 p-6 rounded-2xl border border-slate-700 shadow-xl">
+          {/* Examples */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <label className="block text-sm font-medium text-slate-300">Examples</label>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedExampleId('');
+                  setPrompt('');
+                }}
+                className="text-xs text-slate-400 hover:text-slate-200 transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <select
+                value={selectedExampleId}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  setSelectedExampleId(id);
+                  const ex = PROMPT_EXAMPLES.find((x) => x.id === id);
+                  if (ex) setPrompt(ex.prompt);
+                }}
+                className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 focus:ring-2 focus:ring-hot-wire-500 focus:border-transparent outline-none transition-all"
+              >
+                <option value="" className="bg-slate-900">
+                  Pick an example…
+                </option>
+                {PROMPT_EXAMPLES.map((ex) => (
+                  <option key={ex.id} value={ex.id} className="bg-slate-900">
+                    {ex.label}
+                  </option>
+                ))}
+              </select>
+
+              <div className="flex flex-wrap gap-2">
+                {PROMPT_EXAMPLES.slice(0, 4).map((ex) => (
+                  <button
+                    key={ex.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedExampleId(ex.id);
+                      setPrompt(ex.prompt);
+                    }}
+                    className="px-3 py-1.5 rounded-full text-xs font-medium border border-slate-600 bg-slate-900/60 text-slate-200 hover:bg-slate-900 hover:border-hot-wire-500/60 transition-colors"
+                  >
+                    {ex.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
           <div className="space-y-2">
             <label className="block text-sm font-medium text-slate-300">Description</label>
             <Tooltip text="Describe the shape you want to cut. Be specific about continuous lines for hot wire cutting." className="block w-full">
