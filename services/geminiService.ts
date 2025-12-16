@@ -43,6 +43,11 @@ const patternSchema: Schema = {
 };
 
 export const generatePattern = async (prompt: string): Promise<GeneratedPattern> => {
+  // Procedural fallbacks for a few common shapes to guarantee quality.
+  // This avoids “blob/oval” failures from the LLM for well-defined silhouettes.
+  const procedural = tryProceduralPattern(prompt);
+  if (procedural) return procedural;
+
   const buildContents = (userPrompt: string, extra: string) => `You are an expert CNC Hot Wire Foam Cutter path generator.
       
       User Request: Create a cut path for: "${userPrompt}".
@@ -224,6 +229,58 @@ const postProcessPattern = (pattern: GeneratedPattern): GeneratedPattern => {
   };
 };
 
+// --- Procedural shapes (deterministic) ---
+const tryProceduralPattern = (prompt: string): GeneratedPattern | null => {
+  const p = (prompt || '').toLowerCase();
+  if (!p.includes('heart')) return null;
+
+  // Parametric heart curve (classic)
+  // x(t) = 16 sin^3(t)
+  // y(t) = 13 cos(t) - 5 cos(2t) - 2 cos(3t) - cos(4t)
+  // Produces a clean heart with two lobes and a bottom point.
+  const n = 600; // within 400–800 target
+  const raw: { x: number; y: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    const t = (i / n) * Math.PI * 2;
+    const x = 16 * Math.pow(Math.sin(t), 3);
+    const y =
+      13 * Math.cos(t) -
+      5 * Math.cos(2 * t) -
+      2 * Math.cos(3 * t) -
+      1 * Math.cos(4 * t);
+    raw.push({ x, y });
+  }
+
+  // Normalize into 0..100 with a little padding.
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const pt of raw) {
+    if (pt.x < minX) minX = pt.x;
+    if (pt.x > maxX) maxX = pt.x;
+    if (pt.y < minY) minY = pt.y;
+    if (pt.y > maxY) maxY = pt.y;
+  }
+  const pad = 6; // keep away from edges
+  const scaleX = (100 - pad * 2) / (maxX - minX || 1);
+  const scaleY = (100 - pad * 2) / (maxY - minY || 1);
+  const scale = Math.min(scaleX, scaleY);
+
+  const points = raw.map(({ x, y }) => ({
+    x: clamp((x - minX) * scale + pad, 0, 100),
+    y: clamp((y - minY) * scale + pad, 0, 100),
+  }));
+
+  // Close the loop
+  points.push({ ...points[0] });
+
+  return {
+    name: 'Heart Silhouette',
+    points,
+    description: 'A smooth heart silhouette with two rounded lobes and a pointed bottom, suitable for a continuous hot-wire cut.',
+    difficulty: 'Easy',
+    estimatedCutTime: '3 mins',
+  };
+};
+
 // --- Robust JSON parsing for model output ---
 const stripCodeFences = (s: string) =>
   s
@@ -241,6 +298,26 @@ const extractFirstJsonObject = (s: string) => {
 // Remove common trailing commas: `{ "a": 1, }` or `[1,2,]`
 const removeTrailingCommas = (s: string) => s.replace(/,\s*([}\]])/g, '$1');
 
+/**
+ * Repairs common "almost JSON" issues the model sometimes emits even when asked for strict JSON:
+ * - Missing commas between adjacent objects/arrays (e.g. `}\n{` inside an array)
+ * - Missing commas between adjacent string/number tokens across newlines in arrays (rare)
+ *
+ * This is intentionally conservative and only targets patterns that are very likely formatting mistakes.
+ */
+const repairMissingCommas = (s: string) => {
+  // Insert comma between adjacent objects: `}{` (usually inside arrays)
+  let out = s.replace(/}\s*{/g, '},{');
+
+  // Insert comma between adjacent arrays: `][` (rare, but safe)
+  out = out.replace(/]\s*\[/g, '],[');
+
+  // Insert comma between end-of-object and start-of-array / vice-versa (rare)
+  out = out.replace(/}\s*\[/g, '},[').replace(/]\s*{/g, '],{');
+
+  return out;
+};
+
 const safeParseJsonFromModel = (rawText: string): unknown => {
   const t1 = stripCodeFences(rawText);
   const candidates = [t1, extractFirstJsonObject(t1)].filter(Boolean) as string[];
@@ -252,7 +329,19 @@ const safeParseJsonFromModel = (rawText: string): unknown => {
     } catch (e1) {
       lastErr = e1;
       try {
-        return JSON.parse(removeTrailingCommas(c));
+        const pass1 = removeTrailingCommas(c);
+        try {
+          return JSON.parse(pass1);
+        } catch (e2) {
+          lastErr = e2;
+        }
+
+        const pass2 = repairMissingCommas(pass1);
+        try {
+          return JSON.parse(pass2);
+        } catch (e3) {
+          lastErr = e3;
+        }
       } catch (e2) {
         lastErr = e2;
       }
