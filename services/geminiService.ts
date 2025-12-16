@@ -189,8 +189,26 @@ const postProcessPattern = (pattern: GeneratedPattern): GeneratedPattern => {
 
   if (deduped.length < 4) return pattern;
 
+  /**
+   * Heuristic: Some model outputs come back in SVG screen coordinates (Y grows downward),
+   * which makes letters look upside down in our Cartesian convention.
+   *
+   * For text/multi-letter prompts we request a "baseline segment" along the bottom (y≈0).
+   * If we instead see lots of points hugging y≈100 and few near y≈0, we likely need to flip Y.
+   */
+  const countNear = (arr: { x: number; y: number }[], pred: (p: { x: number; y: number }) => boolean) => {
+    let c = 0;
+    for (const p of arr) if (pred(p)) c++;
+    return c;
+  };
+  const bottomCount = countNear(deduped, (p) => p.y <= 5);
+  const topCount = countNear(deduped, (p) => p.y >= 95);
+  const shouldFlipY = topCount >= 25 && topCount > bottomCount * 2;
+
+  const oriented = shouldFlipY ? deduped.map((p) => ({ x: p.x, y: 100 - p.y })) : deduped;
+
   // Ensure closed (without duplicating the last point for processing)
-  const closedNoDup = samePoint(deduped[0], deduped[deduped.length - 1]) ? deduped.slice(0, -1) : deduped;
+  const closedNoDup = samePoint(oriented[0], oriented[oriented.length - 1]) ? oriented.slice(0, -1) : oriented;
 
   // Smoothing: only when the model gives too few points (don't wash out detail on high-res paths)
   const iterations = closedNoDup.length < 120 ? 3 : closedNoDup.length < 220 ? 2 : 0;
